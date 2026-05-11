@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>金币工坊：Coin Rogue</title>
+  <style>
+    :root { --bg:#141821; --panel:#222a38; --text:#e9eef7; --accent:#6ec1ff; }
+    *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:Arial,Helvetica,sans-serif}
+    .screen{display:none;min-height:100vh;padding:20px}.screen.active{display:flex}
+    .menu,.gameover{flex-direction:column;align-items:center;justify-content:center;gap:14px}
+    button{background:var(--accent);border:none;border-radius:8px;padding:10px 16px;font-weight:700;cursor:pointer}
+    .game{display:grid;grid-template-columns:320px 1fr;gap:16px;align-items:start}
+    .panel{background:var(--panel);padding:12px;border-radius:10px}
+    .stats{display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:14px}
+    canvas{background:#1a222f;border-radius:10px;border:2px solid #2f3b4f;max-width:100%}
+    .overlay{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,.6)}
+    .overlay.active{display:flex}.popup{width:min(560px,95vw);background:#19212f;padding:18px;border-radius:10px;text-align:center}
+    .popup-actions{margin-top:12px;display:flex;justify-content:center;gap:10px}.small{opacity:.85;font-size:12px}
+  </style>
+</head>
+<body>
+  <section id="menuScreen" class="screen menu active">
+    <h1>金币工坊：Coin Rogue</h1>
+    <p>MVP Step 2：关卡目标、投币次数、失败生命与重开机制。</p>
+    <button id="startBtn">开始游戏</button>
+    <p class="small">操作：A/D 或 ←/→ 移动投币口，空格/点击投币，Esc 暂停。</p>
+  </section>
+
+  <section id="gameScreen" class="screen game">
+    <div class="panel">
+      <h3>状态</h3>
+      <div class="stats" id="stats"></div>
+      <p class="small">状态：playing / levelComplete / levelFailed / gameOver / paused</p>
+    </div>
+    <canvas id="gameCanvas" width="900" height="600"></canvas>
+  </section>
+
+  <section id="gameOverScreen" class="screen gameover">
+    <h1>游戏结束</h1><p id="finalText"></p>
+    <button id="restartBtn">重新开始</button>
+  </section>
+
+  <div id="resultOverlay" class="overlay">
+    <div class="popup">
+      <h2 id="resultTitle"></h2>
+      <p id="resultText"></p>
+      <div class="popup-actions" id="resultActions"></div>
+    </div>
+  </div>
+
+<script>
+class Coin {
+  constructor(x,y){this.x=x;this.y=y;this.vx=0;this.vy=0;this.r=10;this.scored=false}
+  update(gm,dt){
+    this.vy+=500*dt; this.x+=this.vx*dt; this.y+=this.vy*dt; this.vx*=0.992;
+    const floor=gm.pusher.platformY-this.r;
+    if(this.y>floor){this.y=floor;this.vy*=-0.3;this.vx*=0.93;if(Math.abs(this.vy)<8)this.vy=0}
+    if(this.x<this.r){this.x=this.r;this.vx*=-0.4} if(this.x>gm.width-this.r){this.x=gm.width-this.r;this.vx*=-0.4}
+    if(!this.scored&&this.y>gm.collectLine&&this.x>gm.collectZone[0]&&this.x<gm.collectZone[1]) gm.collectCoin(this);
+  }
+  draw(ctx){ctx.fillStyle='#d0d6de';ctx.beginPath();ctx.arc(this.x,this.y,this.r,0,Math.PI*2);ctx.fill()}
+}
+
+class CoinSpawner {
+  constructor(gm){this.gm=gm;this.x=gm.width/2}
+  move(dir,dt){this.x=Math.max(20,Math.min(this.gm.width-20,this.x+dir*380*dt))}
+  drop(){
+    if(this.gm.gameState!=='playing')return;
+    if(this.gm.remainingCoins<=0)return;
+    this.gm.remainingCoins--;
+    this.gm.coins.push(new Coin(this.x,35));
+    this.gm.checkLevelFailed();
+  }
+}
+
+class Pusher {
+  constructor(gm){this.gm=gm;this.t=0;this.platformY=380;this.force=0}
+  update(dt){this.t+=dt*1.3;this.force=Math.sin(this.t*2*Math.PI)*55;for(const c of this.gm.coins){if(c.y>this.platformY-30)c.vx+=this.force*dt}}
+  draw(ctx){ctx.fillStyle='#2d3a4f';ctx.fillRect(0,this.platformY,this.gm.width,140);ctx.fillStyle='#3f5374';ctx.fillRect(70,this.platformY-34,760,20+Math.sin(this.t*2*Math.PI)*10)}
+}
+
+class UIManager { constructor(gm){this.gm=gm}
+  updateUI(){document.getElementById('stats').innerHTML=`
+    <div>关卡：${this.gm.level}</div><div>生命：${this.gm.lives}</div>
+    <div>当前分数：${this.gm.currentScore}</div><div>目标分数：${this.gm.targetScore}</div>
+    <div>剩余投币：${this.gm.remainingCoins}</div><div>状态：${this.gm.gameState}</div>`}
+}
+
+class GameManager {
+  constructor(){
+    this.canvas=document.getElementById('gameCanvas');this.ctx=this.canvas.getContext('2d');
+    this.width=this.canvas.width;this.height=this.canvas.height;
+    this.collectLine=530;this.collectZone=[210,690];this.keys={};
+    this.spawner=new CoinSpawner(this);this.pusher=new Pusher(this);this.ui=new UIManager(this);
+    this.startGame();
+  }
+
+  calculateTargetScore(level){return Math.floor(100 * Math.pow(level, 1.6))}
+  startGame(){this.resetGame()}
+  resetGame(){this.level=1;this.lives=3;this.currentScore=0;this.totalScore=0;this.baseCoinsPerLevel=15;this.targetScore=this.calculateTargetScore(this.level);this.startLevel()}
+  startLevel(){this.currentScore=0;this.remainingCoins=this.baseCoinsPerLevel;this.coins=[];this.gameState='playing';this.hideResult();this.updateUI()}
+  nextLevel(){this.level+=1;this.targetScore=this.calculateTargetScore(this.level);this.startLevel()}
+  retryLevel(){this.startLevel()}
+  gameOver(){this.gameState='gameOver';show('gameOverScreen');document.getElementById('finalText').textContent=`你到达第 ${this.level} 关，总分 ${this.totalScore}。`}
+
+  collectCoin(c){
+    c.scored=true;
+    this.currentScore+=10;
+    this.totalScore+=10;
+    this.checkLevelComplete();
+    this.checkLevelFailed();
+    this.updateUI();
+  }
+
+  checkLevelComplete(){
+    if(this.gameState!=='playing')return;
+    if(this.currentScore>=this.targetScore){
+      this.gameState='levelComplete';
+      this.showResult('过关！',`你已达到目标分数 ${this.targetScore}。`,[{label:'进入下一关',onClick:()=>this.nextLevel()}]);
+    }
+  }
+
+  checkLevelFailed(){
+    if(this.gameState!=='playing')return;
+    if(this.remainingCoins<=0 && this.currentScore<this.targetScore){
+      this.lives-=1;
+      if(this.lives>0){
+        this.gameState='levelFailed';
+        this.showResult('本关失败，生命 -1',`剩余生命：${this.lives}`,[{label:'重试本关',onClick:()=>this.retryLevel()}]);
+      }else{this.gameOver()}
+    }
+    this.updateUI();
+  }
+
+  showResult(title,text,actions){
+    const o=document.getElementById('resultOverlay');o.classList.add('active');
+    document.getElementById('resultTitle').textContent=title;
+    document.getElementById('resultText').textContent=text;
+    const box=document.getElementById('resultActions');box.innerHTML='';
+    actions.forEach(a=>{const b=document.createElement('button');b.textContent=a.label;b.onclick=a.onClick;box.appendChild(b)});
+  }
+  hideResult(){document.getElementById('resultOverlay').classList.remove('active')}
+  updateUI(){this.ui.updateUI()}
+
+  update(dt){
+    if(this.gameState==='paused' || this.gameState==='gameOver') return;
+    const dir=(this.keys['a']||this.keys['arrowleft']?-1:0)+(this.keys['d']||this.keys['arrowright']?1:0);
+    this.spawner.move(dir,dt);
+    this.pusher.update(dt);
+    for(const c of this.coins)c.update(this,dt);
+    this.coins=this.coins.filter(c=>!c.scored&&c.y<this.height+60);
+  }
+  draw(){const ctx=this.ctx;ctx.clearRect(0,0,this.width,this.height);ctx.fillStyle='#142030';ctx.fillRect(0,0,this.width,this.height);ctx.fillStyle='#476081';ctx.fillRect(this.spawner.x-22,8,44,22);ctx.fillStyle='#20314a';ctx.fillRect(this.collectZone[0],this.collectLine, this.collectZone[1]-this.collectZone[0], 70);this.pusher.draw(ctx);for(const c of this.coins)c.draw(ctx)}
+  loop(ts){if(!this.last)this.last=ts;const dt=Math.min((ts-this.last)/1000,0.033);this.last=ts;this.update(dt);this.draw();requestAnimationFrame(t=>this.loop(t))}
+}
+
+let gm;
+function show(id){for(const s of document.querySelectorAll('.screen'))s.classList.remove('active');document.getElementById(id).classList.add('active')}
+
+document.getElementById('startBtn').onclick=()=>{show('gameScreen');gm=new GameManager();requestAnimationFrame(t=>gm.loop(t))}
+document.getElementById('restartBtn').onclick=()=>{show('gameScreen');gm=new GameManager();requestAnimationFrame(t=>gm.loop(t))}
+window.addEventListener('keydown',e=>{if(!gm)return;const k=e.key.toLowerCase();gm.keys[k]=true;if(k===' '){e.preventDefault();gm.spawner.drop()}if(k==='escape'){gm.gameState=(gm.gameState==='paused'?'playing':'paused');gm.updateUI();}})
+window.addEventListener('keyup',e=>{if(!gm)return;gm.keys[e.key.toLowerCase()]=false})
+document.getElementById('gameCanvas').addEventListener('click',()=>gm&&gm.spawner.drop())
+</script>
+</body>
+</html>
