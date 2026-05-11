@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>金币工坊：Coin Rogue</title>
+  <style>
+    :root { --bg:#141821; --panel:#222a38; --text:#e9eef7; --accent:#6ec1ff; }
+    *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:Arial,Helvetica,sans-serif}
+    .screen{display:none;min-height:100vh;padding:20px}.screen.active{display:flex}
+    .menu,.gameover{flex-direction:column;align-items:center;justify-content:center;gap:14px}
+    button{background:var(--accent);border:none;border-radius:8px;padding:10px 16px;font-weight:700;cursor:pointer}
+    .game{display:grid;grid-template-columns:320px 1fr;gap:16px;align-items:start}
+    .panel{background:var(--panel);padding:12px;border-radius:10px}
+    .stats{display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:14px}
+    .relics{font-size:13px;line-height:1.6;min-height:100px}
+    canvas{background:#1a222f;border-radius:10px;border:2px solid #2f3b4f;max-width:100%}
+    .overlay{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,.6)}
+    .overlay.active{display:flex}.shop{width:min(760px,95vw);background:#19212f;padding:16px;border-radius:10px}
+    .shop-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}
+    .shop-item{background:#243047;padding:10px;border-radius:8px}.small{opacity:.85;font-size:12px}
+  </style>
+</head>
+<body>
+  <section id="menuScreen" class="screen menu active">
+    <h1>金币工坊：Coin Rogue</h1><p>MVP Demo：投币、推板、过关、商店、肉鸽成长。</p>
+    <button id="startBtn">开始游戏</button>
+    <p class="small">操作：A/D 或 ←/→ 移动投币口，空格/点击投币，S 摇晃，Esc 暂停。</p>
+  </section>
+
+  <section id="gameScreen" class="screen game">
+    <div class="panel">
+      <h3>状态</h3>
+      <div class="stats" id="stats"></div>
+      <h3>道具</h3><div class="relics" id="relics"></div>
+      <p class="small">提示：每关达到目标后进入商店。</p>
+    </div>
+    <canvas id="gameCanvas" width="900" height="600"></canvas>
+  </section>
+
+  <section id="gameOverScreen" class="screen gameover">
+    <h1>游戏结束</h1><p id="finalText"></p>
+    <button id="restartBtn">重新开始</button>
+  </section>
+
+  <div id="shopOverlay" class="overlay">
+    <div class="shop">
+      <h2>商店（可选购 1 件）</h2><p id="shopCoins"></p>
+      <div class="shop-grid" id="shopGrid"></div>
+      <button id="skipShopBtn">跳过商店</button>
+    </div>
+  </div>
+
+  <script>
+    class RelicManager {
+      constructor(){this.relics=[];this.scoreBonus=1;this.startGoldBonus=0;this.pushSpeedMul=1;this.explosionMul=1;this.extraDrops=0}
+      addRelic(r){this.relics.push(r.name);r.apply(this)}
+      getRelicText(){return this.relics.length?this.relics.join('、'):'暂无'}
+    }
+
+    class Coin {
+      constructor(x,y,type){this.x=x;this.y=y;this.vx=0;this.vy=0;this.r=10;this.type=type;this.scored=false;this.exploded=false}
+      color(){return {normal:'#d0d6de',gold:'#ffca2f',bomb:'#ff5b5b',magnet:'#6ed6ff',mult:'#b77dff'}[this.type]}
+      update(gm,dt){
+        this.vy+=500*dt; this.x+=this.vx*dt; this.y+=this.vy*dt; this.vx*=0.992;
+        const floor=gm.pusher.platformY-this.r;
+        if(this.y>floor){this.y=floor;this.vy*=-0.3;this.vx*=0.93;if(Math.abs(this.vy)<8)this.vy=0}
+        if(this.x<this.r){this.x=this.r;this.vx*=-0.4} if(this.x>gm.width-this.r){this.x=gm.width-this.r;this.vx*=-0.4}
+        if(this.type==='magnet'){for(const c of gm.coins){if(c===this)continue;const dx=this.x-c.x,dy=this.y-c.y,d=Math.hypot(dx,dy);if(d<110&&d>2){c.vx+=dx/d*20*dt;c.vy+=dy/d*20*dt}}}
+        if(this.type==='bomb'&&!this.exploded){for(const c of gm.coins){if(c===this)continue;const d=Math.hypot(this.x-c.x,this.y-c.y);if(d<20){gm.explode(this);break}}}
+        if(!this.scored&&this.y>gm.collectLine&&this.x>gm.collectZone[0]&&this.x<gm.collectZone[1]) gm.collectCoin(this);
+      }
+      draw(ctx){ctx.fillStyle=this.color();ctx.beginPath();ctx.arc(this.x,this.y,this.r,0,Math.PI*2);ctx.fill()}
+    }
+
+    class CoinSpawner {
+      constructor(gm){this.gm=gm;this.x=gm.width/2}
+      move(dir,dt){this.x=Math.max(20,Math.min(this.gm.width-20,this.x+dir*380*dt))}
+      drop(){if(this.gm.remainingDrops<=0||this.gm.paused)return;this.gm.remainingDrops--;const roll=Math.random();let type='normal';if(roll>0.9)type='bomb';else if(roll>0.78)type='magnet';else if(roll>0.66)type='mult';else if(roll>0.46)type='gold';this.gm.coins.push(new Coin(this.x,35,type));}
+    }
+
+    class Pusher {
+      constructor(gm){this.gm=gm;this.t=0;this.platformY=380;this.force=0}
+      update(dt){this.t+=dt*(1.3*this.gm.relicManager.pushSpeedMul);this.force=Math.sin(this.t*2*Math.PI)*55;for(const c of this.gm.coins){if(c.y>this.platformY-30)c.vx+=this.force*dt}}
+      draw(ctx){ctx.fillStyle='#2d3a4f';ctx.fillRect(0,this.platformY,this.gm.width,140);ctx.fillStyle='#3f5374';ctx.fillRect(70,this.platformY-34,760,20+Math.sin(this.t*2*Math.PI)*10)}
+    }
+
+    class ShopManager {
+      constructor(gm){this.gm=gm;this.items=[
+        {name:'分数徽章',cost:5,desc:'所有硬币得分 +10%',apply:r=>r.scoreBonus*=1.1},
+        {name:'金币袋',cost:4,desc:'每关开始 +2 金币',apply:r=>r.startGoldBonus+=2},
+        {name:'强力推板',cost:6,desc:'推板速度 +10%',apply:r=>r.pushSpeedMul*=1.1},
+        {name:'爆破手套',cost:6,desc:'爆炸范围 +20%',apply:r=>r.explosionMul*=1.2},
+        {name:'额外投币',cost:5,desc:'每关投币次数 +2',apply:r=>r.extraDrops+=2},
+      ]}
+      open(){const o=document.getElementById('shopOverlay');o.classList.add('active');document.getElementById('shopCoins').textContent=`当前金币：${this.gm.gold}`;const grid=document.getElementById('shopGrid');grid.innerHTML='';for(const it of this.items){const d=document.createElement('div');d.className='shop-item';d.innerHTML=`<h4>${it.name} (${it.cost})</h4><p>${it.desc}</p><button>购买</button>`;d.querySelector('button').onclick=()=>{if(this.gm.gold>=it.cost){this.gm.gold-=it.cost;this.gm.relicManager.addRelic(it);this.close();this.gm.nextLevel();}};grid.appendChild(d)}}
+      close(){document.getElementById('shopOverlay').classList.remove('active')}
+    }
+
+    class UIManager { constructor(gm){this.gm=gm}
+      update(){document.getElementById('stats').innerHTML=`
+      <div>关卡：${this.gm.level}</div><div>生命：${this.gm.lives}</div>
+      <div>分数：${Math.floor(this.gm.score)}</div><div>目标：${this.gm.targetScore}</div>
+      <div>投币：${this.gm.remainingDrops}</div><div>金币：${this.gm.gold}</div>
+      <div>倍率：x${this.gm.multiplier.toFixed(1)}</div><div>暂停：${this.gm.paused?'是':'否'}</div>`;
+      document.getElementById('relics').textContent=this.gm.relicManager.getRelicText();
+      }
+    }
+
+    class GameManager {
+      constructor(){this.canvas=document.getElementById('gameCanvas');this.ctx=this.canvas.getContext('2d');this.width=this.canvas.width;this.height=this.canvas.height;this.collectLine=530;this.collectZone=[210,690];this.keys={};this.resetAll()}
+      resetAll(){this.level=1;this.score=0;this.gold=0;this.lives=3;this.multiplier=1;this.baseDrops=14;this.targetScore=120;this.shakeUsed=false;this.paused=false;this.coins=[];this.relicManager=new RelicManager();this.spawner=new CoinSpawner(this);this.pusher=new Pusher(this);this.shop=new ShopManager(this);this.ui=new UIManager(this);this.startLevel()}
+      startLevel(){this.remainingDrops=this.baseDrops+this.relicManager.extraDrops;this.gold+=this.relicManager.startGoldBonus;this.multiplier=1;this.coins=[];this.shakeUsed=false}
+      nextLevel(){this.level++;this.targetScore=Math.floor(this.targetScore*1.25+40);this.baseDrops+=1;this.startLevel()}
+      loseLevel(){this.lives--;if(this.lives<=0){this.toGameOver();return}this.startLevel()}
+      explode(coin){coin.exploded=true;const r=95*this.relicManager.explosionMul;for(const c of this.coins){const dx=c.x-coin.x,dy=c.y-coin.y,d=Math.hypot(dx,dy);if(d<r&&d>1){const f=(1-d/r)*260;c.vx+=dx/d*f;c.vy+=dy/d*f}}}
+      collectCoin(c){c.scored=true;let s=10;if(c.type==='gold'){s=20;this.gold+=1}else if(c.type==='mult'){s=10;this.multiplier+=0.2}else if(c.type==='bomb'){s=10;this.explode(c)};this.score+=s*this.multiplier*this.relicManager.scoreBonus}
+      shake(){if(this.shakeUsed)return;this.shakeUsed=true;for(const c of this.coins){c.vx+=(Math.random()-0.5)*240;c.vy-=Math.random()*120}}
+      toGameOver(){show('gameOverScreen');document.getElementById('finalText').textContent=`你到达关卡 ${this.level}，总分 ${Math.floor(this.score)}。`}
+      checkEndOfLevel(){if(this.score>=this.targetScore){this.shop.open();return}if(this.remainingDrops<=0&&this.coins.filter(c=>!c.scored).length===0)this.loseLevel()}
+      update(dt){if(this.paused)return;const dir=(this.keys['a']||this.keys['arrowleft']?-1:0)+(this.keys['d']||this.keys['arrowright']?1:0);this.spawner.move(dir,dt);this.pusher.update(dt);for(const c of this.coins)c.update(this,dt);this.coins=this.coins.filter(c=>!c.scored&&c.y<this.height+60);this.checkEndOfLevel();this.ui.update()}
+      draw(){const ctx=this.ctx;ctx.clearRect(0,0,this.width,this.height);ctx.fillStyle='#142030';ctx.fillRect(0,0,this.width,this.height);ctx.fillStyle='#476081';ctx.fillRect(this.spawner.x-22,8,44,22);ctx.fillStyle='#20314a';ctx.fillRect(this.collectZone[0],this.collectLine, this.collectZone[1]-this.collectZone[0], 70);this.pusher.draw(ctx);for(const c of this.coins)c.draw(ctx)}
+      loop(ts){if(!this.last)this.last=ts;const dt=Math.min((ts-this.last)/1000,0.033);this.last=ts;this.update(dt);this.draw();requestAnimationFrame(t=>this.loop(t))}
+    }
+
+    let gm;
+    function show(id){for(const s of document.querySelectorAll('.screen'))s.classList.remove('active');document.getElementById(id).classList.add('active')}
+    document.getElementById('startBtn').onclick=()=>{show('gameScreen');gm=new GameManager();requestAnimationFrame(t=>gm.loop(t))}
+    document.getElementById('restartBtn').onclick=()=>{show('gameScreen');gm=new GameManager();requestAnimationFrame(t=>gm.loop(t))}
+    document.getElementById('skipShopBtn').onclick=()=>{gm.shop.close();gm.nextLevel()}
+    window.addEventListener('keydown',e=>{if(!gm)return;const k=e.key.toLowerCase();gm.keys[k]=true;if(k===' '){e.preventDefault();gm.spawner.drop()}if(k==='s')gm.shake();if(k==='escape')gm.paused=!gm.paused})
+    window.addEventListener('keyup',e=>{if(!gm)return;gm.keys[e.key.toLowerCase()]=false})
+    document.getElementById('gameCanvas').addEventListener('click',()=>gm&&gm.spawner.drop())
+  </script>
+</body>
+</html>
